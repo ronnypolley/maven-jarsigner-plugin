@@ -49,6 +49,9 @@ import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.ResourceBundle;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
+
 import org.apache.maven.shared.utils.ReaderFactory;
 
 /**
@@ -187,6 +190,14 @@ public abstract class AbstractJarsignerMojo
     private boolean protectedAuthenticationPath;
 
     /**
+     * Settings this value to true, the sign and verify goals will use parallelStream to process
+     * the artifacts. As the default ForkJoinPool will be used, the amount of thread will be set
+     * to the number of available processors.
+     */
+    @Parameter( property = "jarsigner.parallel", defaultValue = "false" )
+    private boolean workInParallel;
+
+    /**
      * A set of artifact classifiers describing the project attachments that should be processed. This parameter is only
      * relevant if {@link #processAttachedArtifacts} is <code>true</code>. If empty, all attachments are included.
      *
@@ -267,18 +278,18 @@ public abstract class AbstractJarsignerMojo
                 jarSigner.setToolchain( toolchain );
             }
 
-            int processed = 0;
+            AtomicInteger processed = new AtomicInteger();
 
             if ( this.archive != null )
             {
                 processArchive( this.archive );
-                processed++;
+                processed.getAndIncrement();
             }
             else
             {
                 if ( processMainArtifact )
                 {
-                    processed += processArtifact( this.project.getArtifact() ) ? 1 : 0;
+                    processed.addAndGet( processArtifact( this.project.getArtifact() ) ? 1 : 0 );
                 }
 
                 if ( processAttachedArtifacts )
@@ -295,19 +306,15 @@ public abstract class AbstractJarsignerMojo
                         excludes.addAll( Arrays.asList( excludeClassifiers ) );
                     }
 
-                    for ( Artifact artifact : this.project.getAttachedArtifacts() )
+                    if ( workInParallel )
                     {
-                        if ( !includes.isEmpty() && !includes.contains( artifact.getClassifier() ) )
-                        {
-                            continue;
-                        }
-
-                        if ( excludes.contains( artifact.getClassifier() ) )
-                        {
-                            continue;
-                        }
-
-                        processed += processArtifact( artifact ) ? 1 : 0;
+                        processAttachedArtifacts( processed, includes, excludes,
+                                project.getAttachedArtifacts().parallelStream() );
+                    }
+                    else
+                    {
+                        processAttachedArtifacts( processed, includes, excludes,
+                                project.getAttachedArtifacts().stream() );
                     }
                 }
                 else
@@ -338,10 +345,14 @@ public abstract class AbstractJarsignerMojo
                             + e.getMessage(), e );
                     }
 
-                    for ( File jarFile : jarFiles )
+
+                    if ( workInParallel )
                     {
-                        processArchive( jarFile );
-                        processed++;
+                        processArtifacts( processed, jarFiles.parallelStream() );
+                    }
+                    else
+                    {
+                        processArtifacts( processed, jarFiles.stream() );
                     }
                 }
             }
@@ -352,6 +363,52 @@ public abstract class AbstractJarsignerMojo
         {
             getLog().info( getMessage( "disabled", null ) );
         }
+    }
+
+    private void processAttachedArtifacts( AtomicInteger processed, Collection<String> includes,
+                                           Collection<String> excludes, Stream<Artifact> stream )
+    {
+        stream.filter( artifact -> !includes.contains( artifact.getClassifier() ) )
+                .filter( artifact -> excludes.contains( artifact.getClassifier() ) )
+                .forEach( artifact ->
+                {
+                    try
+                    {
+
+                        if ( verbose )
+                        {
+                            getLog().info(
+                                    "[Thread " + Thread.currentThread().getName()
+                                            + "] Process attached artifact " + artifact.getArtifactId() );
+                        }
+                        processed.addAndGet( processArtifact( artifact ) ? 1 : 0 );
+                    }
+                    catch ( MojoExecutionException e )
+                    {
+                        getLog().error( e );
+                    }
+                } );
+    }
+
+    private void processArtifacts( AtomicInteger processed, Stream<File> stream )
+    {
+        stream.forEach( jarFile ->
+        {
+            try
+            {
+                if ( verbose )
+                {
+                    getLog().info(
+                            "[Thread " + Thread.currentThread().getName() + "] Process artifact " + jarFile.getName() );
+                }
+                processArchive( jarFile );
+            }
+            catch ( MojoExecutionException e )
+            {
+                getLog().error( e );
+            }
+            processed.getAndIncrement();
+        } );
     }
 
     /**
